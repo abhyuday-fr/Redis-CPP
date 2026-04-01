@@ -1,6 +1,13 @@
 # Redis server CPP implementation 
 As much as I love the C++ language, I am making my own Redis server in it.
 
+## To build and run
+- open bash/terminal and run this:
+``` make server ``` and then
+```./server ```
+- Then open a new terminal window (without closing the original one) amd run this:
+``` make client ``` and then ``` ./client```
+
 ## Concepts used in this project
 1. TCP/IP and Socket Programming
 2. Concurrency and Multithrerading
