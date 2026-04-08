@@ -1,33 +1,33 @@
 #include <iostream>
-#include <cstdlib>
-#include <cstdint>
-#include <cstring>
-#include <cerrno>
-#include <cassert>
 #include <string>
 #include <vector>
 #include <string_view>
+#include <cassert>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <cerrno>
 
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 
-static void msg(const std::string_view& msg){
+static void msg(const std::string_view& msg) {
     std::cerr << msg << '\n';
 }
 
-static void die(const std::string_view& msg){
+static void die(const std::string_view& msg) {
     int err = errno;
     std::cerr << "[" << err << "] " << msg << '\n';
     std::abort();
 }
 
-static int32_t read_full(int fd, uint8_t *buf, size_t n){
-    while(n > 0){
+static int32_t read_full(int fd, char *buf, size_t n) {
+    while (n > 0) {
         ssize_t rv = ::read(fd, buf, n);
-        if(rv <= 0){
-            return -1; // error, EOF
+        if (rv <= 0) {
+            return -1;  // error, or unexpected EOF
         }
         assert(static_cast<size_t>(rv) <= n);
         n -= static_cast<size_t>(rv);
@@ -36,123 +36,123 @@ static int32_t read_full(int fd, uint8_t *buf, size_t n){
     return 0;
 }
 
-static int32_t write_all(int fd, const uint8_t *buf, size_t n){
-    while(n > 0){
+static int32_t write_all(int fd, const char *buf, size_t n) {
+    while (n > 0) {
         ssize_t rv = ::write(fd, buf, n);
-        if(rv <= 0){
-            return -1; // error
+        if (rv <= 0) {
+            return -1;  // error
         }
         assert(static_cast<size_t>(rv) <= n);
         n -= static_cast<size_t>(rv);
         buf += rv;
-
     }
     return 0;
 }
 
-// append to the back
-static void buf_append(std::vector<uint8_t> &buf, const uint8_t *data, size_t len){
-    buf.insert(buf.end(), data, data + len);
-}
+constexpr size_t k_max_msg = 4096;
 
-constexpr size_t k_max_msg = 32 << 20; //likely larger than the kernel buffer
-
-//the 'query' function (see previous commit to see that) simply split into  'send_req' and 'read_res'
-
-static int32_t send_req(int fd, const uint8_t *text, size_t len){
-    uint32_t msg_len = static_cast<uint32_t>(len);
-    if(msg_len > k_max_msg){
+static int32_t send_req(int fd, const std::vector<std::string> &cmd) {
+    uint32_t len = 4;
+    for (const std::string &s : cmd) {
+        len += 4 + static_cast<uint32_t>(s.size());
+    }
+    if (len > k_max_msg) {
         return -1;
     }
 
-    std::vector<uint8_t> wbuf;
-    //explicitly copy from a 4 byte uint32_t to avoid size_t architecture mismatches
-    buf_append(wbuf, reinterpret_cast<const uint8_t*>(&msg_len), 4);
-    buf_append(wbuf, text, len);
-
-    return write_all(fd, wbuf.data(), wbuf.size());
+    char wbuf[4 + k_max_msg];
+    std::memcpy(&wbuf[0], &len, 4);  // assume little endian
+    
+    uint32_t n = static_cast<uint32_t>(cmd.size());
+    std::memcpy(&wbuf[4], &n, 4);
+    
+    size_t cur = 8;
+    for (const std::string &s : cmd) {
+        uint32_t p = static_cast<uint32_t>(s.size());
+        std::memcpy(&wbuf[cur], &p, 4);
+        std::memcpy(&wbuf[cur + 4], s.data(), s.size());
+        cur += 4 + s.size();
+    }
+    
+    return write_all(fd, wbuf, 4 + len);
 }
 
-static int32_t read_res(int fd){
+static int32_t read_res(int fd) {
     // 4 bytes header
-    std::vector<uint8_t> rbuf;
-    rbuf.resize(4);
+    char rbuf[4 + k_max_msg];
     errno = 0;
-    int32_t err = read_full(fd, rbuf.data(), 4);
-    if(err){
-        if(errno == 0){
+    int32_t err = read_full(fd, rbuf, 4);
+    if (err) {
+        if (errno == 0) {
             msg("EOF");
-        }
-        else{
+        } else {
             msg("read() error");
         }
         return err;
     }
 
     uint32_t len = 0;
-    std::memcpy(&len, rbuf.data(), 4); // assume little endian
-    if(len > k_max_msg){
+    std::memcpy(&len, rbuf, 4);  // assume little endian
+    if (len > k_max_msg) {
         msg("too long");
         return -1;
     }
 
     // reply body
-    rbuf.resize(4 + len);
     err = read_full(fd, &rbuf[4], len);
-    if(err){
+    if (err) {
         msg("read() error");
         return err;
     }
 
-    // safely truncate to 100 characters for printing using string_view
-    size_t print_len = len < 100 ? len : 100;
-    std::string_view reply_text(reinterpret_cast<const char*>(&rbuf[4]), print_len);
-
-    std::cout << "len: " << len << " data:" << reply_text << '\n';
-
+    // print the result
+    uint32_t rescode = 0;
+    if (len < 4) {
+        msg("bad response");
+        return -1;
+    }
+    std::memcpy(&rescode, &rbuf[4], 4);
+    
+    // Safely print the payload without relying on null-terminators
+    std::string_view reply_text(&rbuf[8], len - 4);
+    std::cout << "server says: [" << rescode << "] " << reply_text << '\n';
+    
     return 0;
 }
 
-int main(){
+int main(int argc, char **argv) {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if(fd < 0){
+    if (fd < 0) {
         die("socket()");
     }
 
     sockaddr_in addr = {};
     addr.sin_family = AF_INET;
-    addr.sin_port = ntohs(1234);
-    addr.sin_addr.s_addr = ntohl(INADDR_LOOPBACK); // 127.0.0.1
-
+    addr.sin_port = htons(1234); // Changed ntohs to htons (Host to Network Short)
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);  // 127.0.0.1
+    
     int rv = ::connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
-    if(rv){
+    if (rv) {
         die("connect");
     }
 
-    // multiple pipelined requests
-    std::vector<std::string> query_list = {
-        "hello1", "hello2", "hello3",
-        // a large message requires multiple event loop iterations
-        std::string(k_max_msg, 'z'),
-        "hello5",
-    };
-
-    for(const std::string &s : query_list){
-        int32_t err = send_req(fd, reinterpret_cast<const uint8_t*>(s.data()), s.size());
-        if(err){
-            goto L_DONE;
-        }
+    // Parse command line arguments into a C++ vector
+    std::vector<std::string> cmd;
+    for (int i = 1; i < argc; ++i) {
+        cmd.push_back(argv[i]);
     }
 
-    for(size_t i = 0; i < query_list.size(); i++){
-        int32_t err = read_res(fd);
-        if(err){
-            goto L_DONE;
-        }
+    int32_t err = send_req(fd, cmd);
+    if (err) {
+        goto L_DONE;
     }
-
-    L_DONE:
-        ::close(fd);
     
+    err = read_res(fd);
+    if (err) {
+        goto L_DONE;
+    }
+
+L_DONE:
+    ::close(fd);
     return 0;
 }

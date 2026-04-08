@@ -15,9 +15,11 @@
 
 // C++ (Standard Library)
 #include <iostream>
-#include <string_view>
+#include <string>
 #include <vector>
+#include <map>
 #include <memory>
+#include <string_view>
 
 static void msg(const std::string_view& msg) {
     std::cerr << msg << '\n';
@@ -96,29 +98,105 @@ static std::unique_ptr<Conn> handle_accept(int fd){
     return conn;
 }
 
-// application callback when the socket is writable
-static void handle_write(Conn *conn){
-    assert(!conn->outgoing.empty());
+constexpr size_t k_max_args = 200 * 1000;
 
-    ssize_t rv = ::write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
-    if(rv < 0 && errno == EAGAIN){
-        return; // actually not ready
+static bool read_u32(const uint8_t *&cur, const uint8_t *end, uint32_t &out){
+    if(cur + 4 > end){
+        return false;
     }
+    std::memcpy(&out, cur, 4);
+    cur += 4;
+    return true;
+}
 
-    if(rv < 0){
-        msg_errno("write() error");
-        conn->want_close = true; //error handling
-        return;
+static bool read_str(const uint8_t *&cur, const uint8_t *end, size_t n, std::string &out){
+    if(cur + n > end){
+        return false;
     }
+    out.assign(reinterpret_cast<const char*>(cur), n);
+    cur += n;
+    return true;
+}
 
-    // remove writte data from `outgoing`
-    buf_consume(conn->outgoing, static_cast<size_t>(rv));
+// +------+-----+------+-----+------+-----+-----+------+
+// | nstr | len | str1 | len | str2 | ... | len | strn |
+// +------+-----+------+-----+------+-----+-----+------+
 
-    // update the readiness intention
-    if(conn->outgoing.empty()){
-        conn->want_read = true;
-        conn->want_write = false;
-    } // else: want write
+static int32_t parse_req(const uint8_t *data, size_t size, std::vector<std::string> &out) {
+    const uint8_t *end = data + size;
+    uint32_t nstr = 0;
+    
+    if (!read_u32(data, end, nstr)) {
+        return -1;
+    }
+    if (nstr > k_max_args) {
+        return -1;  // safety limit
+    }
+    
+    while (out.size() < nstr) {
+        uint32_t len = 0;
+        if (!read_u32(data, end, len)) {
+            return -1;
+        }
+        
+        out.emplace_back(); // safely construct a new empty string in-place
+        if (!read_str(data, end, len, out.back())) {
+            return -1;
+        }
+    }
+    
+    if (data != end) {
+        return -1;  // trailing garbage
+    }
+    return 0;
+}
+
+// Response status codes
+constexpr uint32_t RES_OK = 0;
+constexpr uint32_t RES_ERR = 1; // error
+constexpr uint32_t RES_NX = 2; // key not found
+
+
+// +--------+---------+
+// | status | data... |
+// +--------+---------+
+
+struct Response{
+    uint32_t status = 0;
+    std::vector<uint8_t> data;
+};
+
+// our in-memory Key-Value Store
+static std::map<std::string, std::string> g_data;
+
+static void do_request(std::vector<std::string> &cmd, Response &out){
+    if(cmd.size() == 2 && cmd[0] == "get"){
+        auto it = g_data.find(cmd[1]);
+        if(it == g_data.end()){
+            out.status = RES_NX; // not found
+            return;
+        }
+        const std::string &val = it->second;
+        out.data.assign(val.begin(), val.end());
+    }
+    else if(cmd.size() == 3 && cmd[0] == "set"){
+        g_data[cmd[1]].swap(cmd[2]);
+        out.status = RES_OK;
+    }
+    else if(cmd.size() == 2 && cmd[0] == "del"){
+        g_data.erase(cmd[1]);
+        out.status = RES_OK;
+    }
+    else{
+        out.status = RES_ERR;
+    }
+}
+
+static void make_response(const Response &resp, std::vector<uint8_t> &out){
+    uint32_t resp_len = 4 + static_cast<uint32_t>(resp.data.size());
+    buf_append(out, reinterpret_cast<const uint8_t*>(&resp_len), 4);
+    buf_append(out, reinterpret_cast<const uint8_t*>(&resp.status), 4);
+    buf_append(out, resp.data.data(), resp.data.size());
 }
 
 // process 1 request if there is enough data
@@ -143,19 +221,48 @@ static bool try_one_request(Conn *conn){
 
     const uint8_t *request = &conn->incoming[4];
 
-    // got one request, safely truncate to 100 characters for printing
-    size_t print_len = len < 100 ? len : 100;
-    std::string_view request_text(reinterpret_cast<const char*>(request), print_len);
-    std::cout << "Client says: len:" << len << " data:" << request_text << '\n';
+    // got one request, try to parse the string array
+    std::vector<std::string> cmd;
+    if(parse_req(request, len, cmd) < 0){
+        msg("bad request");
+        conn->want_close = true;
+        return false; // want close
+    }
 
-    // generate the response (echo)
-    buf_append(conn->outgoing, reinterpret_cast<const uint8_t*>(&len), 4);
-    buf_append(conn->outgoing, request, len);
+
+    Response resp;
+    do_request(cmd, resp);
+    make_response(resp, conn->outgoing);
 
     // application logic done! remove the request message.
     buf_consume(conn->incoming, 4 + len);
 
     return true;
+}
+
+// application callback when the socket is writable
+static void handle_write(Conn *conn){
+    assert(!conn->outgoing.empty());
+
+    ssize_t rv = ::write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+    if(rv < 0 && errno == EAGAIN){
+        return; // actually not ready
+    }
+
+    if(rv < 0){
+        msg_errno("write() error");
+        conn->want_close = true; //error handling
+        return;
+    }
+
+    // remove writte data from `outgoing`
+    buf_consume(conn->outgoing, static_cast<size_t>(rv));
+
+    // update the readiness intention
+    if(conn->outgoing.empty()){
+        conn->want_read = true;
+        conn->want_write = false;
+    } // else: want write
 }
 
 // application callback when the sokcet is readable
@@ -204,8 +311,6 @@ static void handle_read(Conn *conn){
 }
 
 int main(){
-    
-    std::cout << "Server is Running\n";
 
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if(fd < 0){
@@ -237,10 +342,12 @@ int main(){
     }
 
     // a map of all client connections, keyed by fd
-    // using std::unique_ptr ensures memory is freed automatically when the socket closes.
     std::vector<std::unique_ptr<Conn>> fd2conn;
+
+    // the event loop
     std::vector<pollfd> poll_args;
-    std::cout << "Event loop started. Listening on port 1234...\n";
+
+    std::cout << "KV Server runnning on port 1234...\n";
     
     while(true){
         poll_args.clear();
