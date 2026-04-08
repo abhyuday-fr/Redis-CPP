@@ -5,8 +5,16 @@ As much as I love the C++ language, I am making my own Redis server in it.
 - open bash/terminal and run this:
 ``` make server ``` and then
 ```./server ```
+
 - Then open a new terminal window (without closing the original one) amd run this:
-``` make client ``` and then ``` ./client```
+``` make client ``` and then 
+
+    - To set a Key-Value pair in the server
+    ``` ./client set <Key> <Value>```
+    - To get a Key-Value pair in the server
+    ``` ./client get```
+    - To delete a Key-Value pair existing in the server
+    ``` ./client del <Key> <Value> ```
 
 ## Concepts used in this project
 1. TCP/IP and Socket Programming
