@@ -321,7 +321,7 @@ int main(){
     int val = 1;
     ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
 
-    // bind
+    // bind i.e associating socket w/ ip address and port number
     sockaddr_in addr = {};
     addr.sin_family = AF_INET;
     addr.sin_port = ntohs(1234);
